@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Generated run artifacts (keep the directories, ignore their contents).
+receipts/*
+reports/*
+harnesses/*
+!receipts/.gitkeep
+!reports/.gitkeep
+!harnesses/.gitkeep

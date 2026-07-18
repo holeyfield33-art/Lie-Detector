@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toylib"
+version = "1.0.0"
+description = "A tiny demo library with true, false and untestable README claims."
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["toylib"]
