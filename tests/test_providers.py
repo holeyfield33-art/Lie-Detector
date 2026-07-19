@@ -12,8 +12,21 @@ from typing import Any
 
 import pytest
 
+from liedetector import llm
 from liedetector.cli import _build_llm_client, _load_dotenv, build_parser
 from liedetector.llm import AnthropicClient, OpenAIClient
+
+
+class _FakeStatusError(Exception):
+    """Stand-in for an SDK APIStatusError carrying an HTTP status code."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+class APIConnectionError(Exception):
+    """Named to match the real SDKs' connection-error class; no status_code."""
 
 
 class _FakeMessage:
@@ -128,6 +141,103 @@ def test_openai_client_forwards_base_url_and_api_key(monkeypatch: pytest.MonkeyP
     instance = holder["instance"]  # type: ignore[index]
     assert instance.kwargs["base_url"] == "https://api.featherless.ai/v1"
     assert instance.kwargs["api_key"] == "secret"
+
+
+def test_openai_client_retries_transient_error_during_schema_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429/5xx during the json_schema probe must not be read as 'unsupported'.
+
+    Regression test: this used to permanently disable json_schema mode on the
+    first rate limit, identical to what a live Featherless run hit.
+    """
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    holder = _patch_openai(
+        monkeypatch, [_FakeStatusError(429), _FakeStatusError(429), '{"claims": []}']
+    )
+    client = OpenAIClient()
+    result = client.complete("s", "u", {})
+    assert result == '{"claims": []}'
+    assert client._supports_json_schema is True  # not poisoned to False
+    instance = holder["instance"]  # type: ignore[index]
+    assert all(
+        call["response_format"]["type"] == "json_schema"
+        for call in instance.chat.completions.calls
+    )
+
+
+def test_openai_client_raises_after_exhausting_retries_without_poisoning_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    _patch_openai(monkeypatch, [_FakeStatusError(429)] * llm._MAX_ATTEMPTS)
+    client = OpenAIClient()
+    with pytest.raises(_FakeStatusError):
+        client.complete("s", "u", {})
+    assert client._supports_json_schema is None  # still unknown, not False
+
+
+# --- retry helper -------------------------------------------------------------
+
+
+def test_is_transient_true_for_retryable_status_codes() -> None:
+    assert llm._is_transient(_FakeStatusError(429))
+    assert llm._is_transient(_FakeStatusError(503))
+
+
+def test_is_transient_false_for_non_retryable_status_codes() -> None:
+    assert not llm._is_transient(_FakeStatusError(400))
+    assert not llm._is_transient(_FakeStatusError(401))
+
+
+def test_is_transient_true_for_connection_errors() -> None:
+    assert llm._is_transient(APIConnectionError("boom"))
+
+
+def test_is_transient_false_for_plain_exceptions() -> None:
+    assert not llm._is_transient(ValueError("bad schema"))
+
+
+def test_call_with_retry_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def flaky() -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _FakeStatusError(429)
+        return "ok"
+
+    assert llm._call_with_retry(flaky) == "ok"
+    assert calls["n"] == 3
+
+
+def test_call_with_retry_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def always_fails() -> str:
+        calls["n"] += 1
+        raise _FakeStatusError(503)
+
+    with pytest.raises(_FakeStatusError):
+        llm._call_with_retry(always_fails)
+    assert calls["n"] == llm._MAX_ATTEMPTS
+
+
+def test_call_with_retry_does_not_retry_non_transient_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def bad_request() -> str:
+        calls["n"] += 1
+        raise _FakeStatusError(400)
+
+    with pytest.raises(_FakeStatusError):
+        llm._call_with_retry(bad_request)
+    assert calls["n"] == 1
 
 
 # --- _build_llm_client dispatch ----------------------------------------------

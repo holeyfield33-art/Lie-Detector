@@ -32,7 +32,12 @@ from .utils import LieDetectorError
 log = logging.getLogger("liedetector.executor")
 
 EXECUTION_TIMEOUT_S = 120
-INSTALL_TIMEOUT_S = 600
+# 600s was too short for real-world ML dependency trees: torch's default
+# (CUDA-bundled) wheel plus transformers/accelerate can be several GB, and a
+# genuine target repo (unitarity-lab) still exceeded 600s after the tmpfs fix
+# above. 1800s is a still-bounded ceiling (never unbounded) sized for that
+# class of repo; a timeout still resolves to INCONCLUSIVE, never a crash.
+INSTALL_TIMEOUT_S = 1800
 
 _RESULT_LINE = re.compile(r"::(test_control|test_claim)\b.*\b(PASSED|FAILED|ERROR)")
 
@@ -148,7 +153,11 @@ class DockerExecutor:
                 *self._proxy_install_args(),
                 "--user", "1000:1000",
                 "-e", "HOME=/tmp",
-                "--tmpfs", "/tmp:rw,size=512m",
+                # 512m was too small for real-world ML dependency trees
+                # (torch + transformers + accelerate alone exceed it: "No
+                # space left on device" on a genuine target repo). 4g covers
+                # heavy scientific/ML stacks while staying a bounded limit.
+                "--tmpfs", "/tmp:rw,size=4096m",
                 "-v", f"{self._repo_path}:/repo:ro",
                 "-v", f"{env_path}:/env:rw",
                 "--cap-drop", "ALL",

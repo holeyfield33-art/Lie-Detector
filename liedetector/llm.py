@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections.abc import Callable
 from importlib import resources
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from .models import SchemaValidationError, validate_schema
 from .utils import LieDetectorError
@@ -33,6 +35,56 @@ REPAIR_INSTRUCTION = (
     "Return a corrected JSON object that fixes exactly these errors. "
     "Do not change anything else. Respond with JSON only."
 )
+
+#: HTTP status codes worth retrying: rate limits and server-side failures.
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 5
+_BASE_DELAY_S = 2.0
+_MAX_DELAY_S = 30.0
+
+_T = TypeVar("_T")
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for rate limits, server errors, and connection-level failures.
+
+    Both the Anthropic and OpenAI SDKs raise ``APIStatusError`` subclasses
+    carrying ``status_code`` for HTTP-level failures, and separate
+    ``APIConnectionError``/``APITimeoutError`` classes (no ``status_code``)
+    for network-level failures. Both families are transient by nature;
+    everything else (auth, bad request, validation) is not and should fail
+    immediately rather than retry.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status in _RETRYABLE_STATUS_CODES
+    return type(exc).__name__ in ("APIConnectionError", "APITimeoutError")
+
+
+def _call_with_retry(call: Callable[[], _T]) -> _T:
+    """Retry a provider call on transient errors with exponential backoff.
+
+    Non-transient errors (auth failures, bad requests, unsupported features)
+    propagate on the first attempt. A transient error that survives every
+    retry propagates as its original exception type.
+    """
+    attempt = 0
+    while True:
+        try:
+            return call()
+        except Exception as exc:
+            attempt += 1
+            if attempt >= _MAX_ATTEMPTS or not _is_transient(exc):
+                raise
+            delay = min(_BASE_DELAY_S * (2 ** (attempt - 1)), _MAX_DELAY_S)
+            log.warning(
+                "transient provider error on attempt %d/%d; retrying in %.0fs: %s",
+                attempt,
+                _MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
 
 
 class LLMError(LieDetectorError):
@@ -67,12 +119,14 @@ class AnthropicClient:
         self.max_tokens = max_tokens
 
     def complete(self, system: str, user: str, schema: dict[str, Any]) -> str:
-        response = self._client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_config={"format": {"type": "json_schema", "schema": schema}},
+        response = _call_with_retry(
+            lambda: self._client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+            )
         )
         for block in response.content:
             if block.type == "text":
@@ -117,18 +171,20 @@ class OpenAIClient:
         # Featherless, and most modern providers).
         if self._supports_json_schema is not False:
             try:
-                response = self._client.chat.completions.create(  # type: ignore[call-overload]
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    messages=messages,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "response",
-                            "strict": True,
-                            "schema": schema,
+                response = _call_with_retry(
+                    lambda: self._client.chat.completions.create(  # type: ignore[call-overload]
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "response",
+                                "strict": True,
+                                "schema": schema,
+                            },
                         },
-                    },
+                    )
                 )
                 self._supports_json_schema = True
                 content = response.choices[0].message.content
@@ -136,6 +192,12 @@ class OpenAIClient:
                     raise LLMError("model returned no content")
                 return str(content)
             except Exception as exc:
+                if _is_transient(exc):
+                    # A rate limit or server error is not evidence the
+                    # provider lacks json_schema support (_call_with_retry
+                    # already exhausted retries) - propagate as a real
+                    # failure instead of permanently disabling json_schema.
+                    raise
                 if self._supports_json_schema is None:
                     log.info(
                         "json_schema response_format failed (%s); falling back to "
@@ -159,11 +221,13 @@ class OpenAIClient:
             fallback_messages.append({"role": "system", "content": system})
         fallback_messages.append({"role": "user", "content": fallback_user})
 
-        response = self._client.chat.completions.create(  # type: ignore[call-overload]
-            model=self.model,
-            max_tokens=self.max_tokens,
-            messages=fallback_messages,
-            response_format={"type": "json_object"},
+        response = _call_with_retry(
+            lambda: self._client.chat.completions.create(  # type: ignore[call-overload]
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=fallback_messages,
+                response_format={"type": "json_object"},
+            )
         )
         content = response.choices[0].message.content
         if content is None:
