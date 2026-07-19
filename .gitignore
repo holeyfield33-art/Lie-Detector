@@ -8,6 +8,8 @@ dist/
 .ruff_cache/
 .venv/
 venv/
+env/
+.env
 
 # Generated run artifacts (keep the directories, ignore their contents).
 receipts/*

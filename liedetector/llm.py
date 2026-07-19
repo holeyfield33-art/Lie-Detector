@@ -25,6 +25,7 @@ from .utils import LieDetectorError
 log = logging.getLogger("liedetector.llm")
 
 DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_OPENAI_MODEL = "gpt-4o"
 
 REPAIR_INSTRUCTION = (
     "Your previous response failed schema validation with these errors:\n"
@@ -77,6 +78,97 @@ class AnthropicClient:
             if block.type == "text":
                 return str(block.text)
         raise LLMError(f"model returned no text block (stop_reason={response.stop_reason})")
+
+
+class OpenAIClient:
+    """OpenAI-compatible client (OpenAI, Featherless, etc.) with structured JSON output.
+
+    Uses ``response_format`` with ``json_schema`` when the provider supports it;
+    falls back to prompting for JSON if the provider only supports ``json_object``
+    mode (detected automatically on first failure).
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_OPENAI_MODEL,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        max_tokens: int = 16000,
+    ) -> None:
+        import openai
+
+        client_kwargs: dict[str, Any] = {}
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        if api_key is not None:
+            client_kwargs["api_key"] = api_key
+        self._client = openai.OpenAI(**client_kwargs)
+        self.model = model
+        self.max_tokens = max_tokens
+        self._supports_json_schema: bool | None = None  # None = not yet probed
+
+    def complete(self, system: str, user: str, schema: dict[str, Any]) -> str:
+        messages: list[dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+
+        # First attempt: try json_schema response_format (supported by OpenAI,
+        # Featherless, and most modern providers).
+        if self._supports_json_schema is not False:
+            try:
+                response = self._client.chat.completions.create(  # type: ignore[call-overload]
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    messages=messages,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "response",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                )
+                self._supports_json_schema = True
+                content = response.choices[0].message.content
+                if content is None:
+                    raise LLMError("model returned no content")
+                return str(content)
+            except Exception as exc:
+                if self._supports_json_schema is None:
+                    log.info(
+                        "json_schema response_format failed (%s); falling back to "
+                        "json_object mode with schema in prompt",
+                        exc,
+                    )
+                    self._supports_json_schema = False
+                else:
+                    raise
+
+        # Fallback: json_object mode with schema embedded in the prompt.
+        schema_json = json.dumps(schema)
+        fallback_user = (
+            f"{user}\n\n"
+            f"You MUST respond with a single JSON object that conforms to this schema:\n"
+            f"```json\n{schema_json}\n```\n"
+            f"Respond with ONLY the JSON object, no other text."
+        )
+        fallback_messages: list[dict[str, Any]] = []
+        if system:
+            fallback_messages.append({"role": "system", "content": system})
+        fallback_messages.append({"role": "user", "content": fallback_user})
+
+        response = self._client.chat.completions.create(  # type: ignore[call-overload]
+            model=self.model,
+            max_tokens=self.max_tokens,
+            messages=fallback_messages,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        if content is None:
+            raise LLMError("model returned no content")
+        return str(content)
 
 
 def _parse_and_validate(raw: str, schema: dict[str, Any]) -> dict[str, Any]:

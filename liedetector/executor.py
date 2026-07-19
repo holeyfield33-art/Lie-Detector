@@ -137,7 +137,9 @@ class DockerExecutor:
         build artifacts (``*.egg-info``) never touch the source tree.
         """
         self._repo_path = repo_path.resolve()
-        self._env_dir = tempfile.TemporaryDirectory(prefix="liedetector-env-")
+        self._env_dir = tempfile.TemporaryDirectory(
+            prefix="liedetector-env-", ignore_cleanup_errors=True
+        )
         env_path = Path(self._env_dir.name)
         env_path.chmod(0o777)
         code, stdout, stderr, timed_out = self._docker(
@@ -204,6 +206,20 @@ class DockerExecutor:
 
     def cleanup(self) -> None:
         if self._env_dir is not None:
+            env_path = Path(self._env_dir.name)
+            # `python -m venv` creates POSIX symlinks inside the venv (e.g.
+            # venv/lib64 -> venv/lib). On a Windows host bind-mounting this
+            # directory into the container, those symlinks materialise as
+            # reparse points that Windows' own filesystem APIs cannot open
+            # or traverse (WinError 1920), so a host-side rmtree crashes.
+            # Let the container remove its own tree with POSIX semantics
+            # first; ignore_cleanup_errors=True above is a defense-in-depth
+            # fallback if Docker itself is unavailable at this point.
+            subprocess.run(
+                ["docker", "run", "--rm", "-v", f"{env_path}:/env:rw", self.image,
+                 "sh", "-c", "rm -rf /env/venv"],
+                capture_output=True,
+            )
             self._env_dir.cleanup()
             self._env_dir = None
 

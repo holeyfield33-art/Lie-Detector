@@ -1,13 +1,16 @@
 # The Lie Detector - developer workflow.
 #
 # `make demo` runs the full pipeline end-to-end against the bundled toy repo.
-# It requires a working Docker daemon and an Anthropic credential
-# (ANTHROPIC_API_KEY or a stored `ant auth login` profile).
+# It requires a working Docker daemon and an LLM credential:
+#   - Anthropic: ANTHROPIC_API_KEY or a stored `ant auth login` profile
+#   - OpenAI-compatible (Featherless, etc.): OPENAI_API_KEY or FEATHERLESS_API_KEY
+#     plus OPENAI_BASE_URL (e.g. https://api.featherless.ai/v1)
+# Use `--provider openai` to switch backends.
 
 .PHONY: install lint type test test-docker demo doctor check clean
 
 install:
-	pip install -e ".[dev]"
+	pip install -e ".[dev,openai]"
 
 lint:
 	ruff check liedetector tests

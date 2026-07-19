@@ -65,9 +65,13 @@ See [`SECURITY.md`](SECURITY.md) for the full sandbox and prompt-safety model.
 liedetector run <repo_url>    # full pipeline against a GitHub repository
 liedetector verify <receipt>  # recompute hashes, validate receipt integrity
 liedetector demo              # run against the bundled toy repo
-liedetector doctor            # check Docker, Python, dependencies
+liedetector doctor            # check Docker, Python, provider credentials
 liedetector version
 ```
+
+`run` and `demo` both accept `--provider {anthropic,openai}`, `--model`, and
+`--base-url` (see [LLM providers](#llm-providers)); `doctor` reports the
+status of both providers so you can see which one is ready to use.
 
 `liedetector verify` recomputes every artifact hash and the receipt hash from
 stored artifacts and confirms they match — tamper with any artifact and it
@@ -77,20 +81,60 @@ fails.
 
 - Python 3.11+
 - Docker (image is pinned by digest; `python:3.12-slim@sha256:...`)
-- An Anthropic credential: `ANTHROPIC_API_KEY`, or a stored `ant auth login`
-  profile.
+- An LLM credential for one of the two supported providers:
+  - **Anthropic** (default): `ANTHROPIC_API_KEY`, or a stored `ant auth login`
+    profile.
+  - **OpenAI-compatible** (OpenAI, Featherless, OpenRouter, local llama.cpp,
+    etc.): `OPENAI_API_KEY` or `FEATHERLESS_API_KEY`, plus `OPENAI_BASE_URL`
+    pointing at the provider's endpoint. Select it with `--provider openai`.
+
+See [RUN_GUIDE.md](RUN_GUIDE.md) for full setup instructions, including
+Docker Desktop/WSL2 on Windows and Featherless configuration.
 
 ## Install
 
 ```bash
-pip install -e ".[dev]"
-liedetector doctor    # verify your environment
+pip install -e ".[dev,openai]"   # omit ",openai" if you only use Anthropic
+liedetector doctor                # verify your environment
 ```
+
+Copy [`.env.example`](.env.example) to `.env` and fill in your credentials;
+`liedetector` loads `.env` from the current directory automatically (without
+overriding variables already set in your shell). `.env` is git-ignored and
+never committed — see [RUN_GUIDE.md](RUN_GUIDE.md#credentials) before editing
+`.env.example`, which must only ever contain placeholder values.
+
+## LLM providers
+
+Every command that calls a model (`run`, `demo`) accepts:
+
+```
+--provider {anthropic,openai}   # default: anthropic
+--model <name>                  # override the provider's default model
+--base-url <url>                # OpenAI-compatible endpoint, e.g. Featherless
+```
+
+```bash
+# Anthropic (default)
+liedetector demo
+
+# Featherless, via OpenAI-compatible API
+liedetector demo --provider openai --base-url https://api.featherless.ai/v1 \
+  --model <model-id>
+```
+
+`--base-url` can also come from `OPENAI_BASE_URL`. The OpenAI-compatible
+client tries schema-constrained `json_schema` output first and transparently
+falls back to `json_object` mode with the schema embedded in the prompt if
+the provider doesn't support structured outputs — the Generate -> Validate ->
+Repair -> Validate -> Fail loop (`llm.py`) is identical for both providers.
 
 ## Demo
 
 ```bash
 make demo
+# or, against Featherless:
+liedetector demo --provider openai --base-url https://api.featherless.ai/v1
 ```
 
 The bundled `demo/toy_repo/` has known-true claims (`add`, `slugify`),
@@ -112,6 +156,21 @@ make check        # ruff + mypy (strict) + hermetic tests
 make test         # hermetic unit/integration tests (no Docker, no API)
 make test-docker  # opt-in real-sandbox end-to-end test (requires Docker)
 ```
+
+The hermetic suite and `test-docker` both pass on Windows. Two host-filesystem
+quirks are worked around internally and are worth knowing about if you're
+modifying `cli.py`, `utils.py`, or `executor.py`:
+
+- Hashed artifacts (`README.md`, harnesses, logs) are written as raw UTF-8
+  bytes, not via text-mode `write_text`, so Windows' newline translation
+  (`\n` -> `\r\n`) can never desync the on-disk bytes from the hash the
+  receipt committed to.
+- The cloned workspace and the Docker executor's venv volume are cleaned up
+  defensively: Git marks objects read-only (Windows refuses to delete a
+  read-only file regardless of directory permissions) and `python -m venv`
+  creates a `lib64 -> lib` POSIX symlink that Windows can't traverse when the
+  volume is bind-mounted from a Linux container. Both are cleared/removed
+  before the host-side `rmtree` runs.
 
 The hermetic test suite drives the whole pipeline with a scripted model and a
 fake sandbox, so it is byte-stable and needs neither Docker nor an API key. The

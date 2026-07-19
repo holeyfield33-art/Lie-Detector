@@ -19,6 +19,9 @@ dev = [
     "mypy>=1.10",
     "ruff>=0.5",
 ]
+openai = [
+    "openai>=1.0.0",
+]
 
 [project.scripts]
 liedetector = "liedetector.cli:main"
@@ -45,9 +48,13 @@ warn_unused_ignores = false
 module = "anthropic.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "openai.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "docker: tests that require a working Docker daemon",
-    "llm: tests that require a live Anthropic API credential",
+    "llm: tests that require a live LLM API credential (Anthropic or OpenAI)",
 ]

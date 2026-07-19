@@ -80,6 +80,15 @@ mismatch.
 
 Logs are structured JSON. Secrets, credentials, and tokens are never logged.
 
+## Credentials
+
+`liedetector` reads provider credentials (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `FEATHERLESS_API_KEY`) from the environment, optionally
+loaded from a `.env` file in the current directory (`.env` is git-ignored and
+never overrides a variable already set in the shell). `.env.example` is
+tracked and must **only ever contain placeholder values** — never a real key,
+even temporarily. If you touch `.env.example`, diff it before committing.
+
 ## Reporting a vulnerability
 
 Open a private security advisory on the repository, or contact the maintainers
