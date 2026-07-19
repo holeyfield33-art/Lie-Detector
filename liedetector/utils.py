@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -111,6 +113,22 @@ class RepositoryInfo:
     default_branch: str
 
 
+def _clear_readonly(path: str) -> None:
+    """Clear the read-only attribute on every entry under ``path``.
+
+    Git marks files under ``.git/objects`` read-only; on Windows, unlike
+    POSIX, ``rmtree`` cannot delete a read-only file regardless of directory
+    permissions, so a plain ``rmtree`` silently leaks the clone.  This makes
+    every entry writable first so the follow-up ``rmtree`` actually succeeds.
+    """
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+            except OSError:
+                pass
+
+
 class Workspace:
     """Temporary clone of the target repository.
 
@@ -149,6 +167,7 @@ class Workspace:
         tb: TracebackType | None,
     ) -> None:
         if self._tmp is not None:
+            _clear_readonly(self._tmp)
             shutil.rmtree(self._tmp, ignore_errors=True)
             self._tmp = None
 

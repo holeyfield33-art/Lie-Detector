@@ -25,12 +25,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
-from . import DOCKER_IMAGE, TOOL_VERSION
+from . import DEFAULT_OPENAI_MODEL, DOCKER_IMAGE, TOOL_VERSION
 from .adjudicate import adjudicate, adjudicate_harness_failure, adjudicate_install_failure
 from .classify import classify
 from .executor import DockerExecutor, Executor, docker_available
 from .extract import extract_claims
-from .llm import AnthropicClient, LLMClient, LLMError
+from .llm import AnthropicClient, LLMClient, LLMError, OpenAIClient
 from .models import Evaluation, InstallResult
 from .receipt import build_receipt, verify_receipt, write_receipt
 from .refine import refine
@@ -179,6 +179,19 @@ def run_pipeline(
         )
 
 
+def _write_hashed_text(path: Path, text: str) -> None:
+    """Write text as raw UTF-8 bytes, with no newline translation.
+
+    Every artifact written here was hashed in-memory (LF-only, since
+    ``Path.read_text`` and f-string log builders never introduce ``\\r\\n``).
+    ``Path.write_text`` applies platform newline translation on write, which
+    on Windows turns ``\\n`` into ``\\r\\n`` and makes the on-disk bytes no
+    longer match the hash the receipt committed to. Writing raw bytes keeps
+    the artifact byte-identical to what was hashed on every platform.
+    """
+    path.write_bytes(text.encode("utf-8"))
+
+
 def _write_bundle(
     bundle_dir: Path,
     readme_text: str,
@@ -188,18 +201,19 @@ def _write_bundle(
     """Write every hashed artifact into the self-contained receipt bundle."""
     (bundle_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     (bundle_dir / "logs").mkdir(parents=True, exist_ok=True)
-    (bundle_dir / "artifacts" / "README.md").write_text(readme_text, encoding="utf-8")
+    _write_hashed_text(bundle_dir / "artifacts" / "README.md", readme_text)
     if install is not None:
-        (bundle_dir / "logs" / "install.txt").write_text(install.log, encoding="utf-8")
+        _write_hashed_text(bundle_dir / "logs" / "install.txt", install.log)
     for evaluation in evaluations:
         if evaluation.harness_code is not None:
             (bundle_dir / "harnesses").mkdir(parents=True, exist_ok=True)
-            (bundle_dir / "harnesses" / f"{evaluation.claim.id}.py").write_text(
-                evaluation.harness_code, encoding="utf-8"
+            _write_hashed_text(
+                bundle_dir / "harnesses" / f"{evaluation.claim.id}.py", evaluation.harness_code
             )
         for run in evaluation.runs:
-            (bundle_dir / "logs" / f"{evaluation.claim.id}_run{run.run_index}.txt").write_text(
-                run.log_text(), encoding="utf-8"
+            _write_hashed_text(
+                bundle_dir / "logs" / f"{evaluation.claim.id}_run{run.run_index}.txt",
+                run.log_text(),
             )
 
 
@@ -212,8 +226,23 @@ def _print_summary(result: PipelineResult) -> None:
     print(f"Truth Report: {result.report_path}")
 
 
+def _build_llm_client(args: argparse.Namespace) -> LLMClient:
+    """Instantiate the correct LLM client based on CLI arguments."""
+    if args.provider == "openai":
+        base_url = args.base_url or os.environ.get("OPENAI_BASE_URL")
+        api_key = (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("FEATHERLESS_API_KEY")
+        )
+        model = args.model or DEFAULT_OPENAI_MODEL
+        return OpenAIClient(model=model, base_url=base_url, api_key=api_key)
+    else:
+        model = args.model or "claude-opus-4-8"
+        return AnthropicClient(model=model)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    llm: LLMClient = AnthropicClient()
+    llm: LLMClient = _build_llm_client(args)
     executor: Executor = DockerExecutor()
     result = run_pipeline(
         args.repo_url,
@@ -253,7 +282,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             ["git", "commit", "--quiet", "-m", "toy repo"],
         ):
             subprocess.run(cmd, cwd=demo_repo, env=env, check=True, capture_output=True)
-        llm: LLMClient = AnthropicClient()
+        llm: LLMClient = _build_llm_client(args)
         executor: Executor = DockerExecutor()
         result = run_pipeline(
             str(demo_repo),
@@ -300,18 +329,35 @@ def _cmd_doctor(_: argparse.Namespace) -> int:
         print(f"[FAIL] docker unavailable: {detail}")
     print(f"      sandbox image (pinned by digest): {DOCKER_IMAGE}")
 
+    # Anthropic provider check
     try:
         import anthropic  # noqa: F401
 
         print("[ok ] anthropic SDK installed")
     except ImportError:
-        ok = False
-        print("[FAIL] anthropic SDK not installed")
+        print("[warn] anthropic SDK not installed (pip install anthropic)")
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
         print("[ok ] Anthropic credential present in environment")
     else:
         print("[warn] no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN set "
               "(the SDK may still resolve a stored profile)")
+
+    # OpenAI-compatible provider check
+    try:
+        import openai  # noqa: F401
+
+        print("[ok ] openai SDK installed")
+    except ImportError:
+        print("[warn] openai SDK not installed (pip install openai)")
+    openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("FEATHERLESS_API_KEY")
+    if openai_key:
+        print("[ok ] OpenAI-compatible credential present in environment")
+    else:
+        print("[warn] no OPENAI_API_KEY or FEATHERLESS_API_KEY set")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    if base_url:
+        print(f"[info] OPENAI_BASE_URL set to {base_url}")
+
     return 0 if ok else 1
 
 
@@ -329,9 +375,29 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--reports-dir", default="reports", help="Truth Report directory")
         p.add_argument("--harnesses-dir", default="harnesses", help="harness copy directory")
 
+    def add_provider_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--provider",
+            choices=["anthropic", "openai"],
+            default="anthropic",
+            help="LLM provider backend (default: anthropic)",
+        )
+        p.add_argument(
+            "--model",
+            default=None,
+            help="override the default model for the chosen provider",
+        )
+        p.add_argument(
+            "--base-url",
+            default=None,
+            help="API base URL for OpenAI-compatible providers "
+            "(e.g. https://api.featherless.ai/v1). Also settable via OPENAI_BASE_URL env var.",
+        )
+
     p_run = sub.add_parser("run", help="run the full pipeline against a GitHub repository")
     p_run.add_argument("repo_url", help="https://github.com/<owner>/<repo>")
     add_output_dirs(p_run)
+    add_provider_args(p_run)
     p_run.set_defaults(func=_cmd_run)
 
     p_verify = sub.add_parser(
@@ -342,6 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_demo = sub.add_parser("demo", help="run the pipeline against the bundled toy repo")
     add_output_dirs(p_demo)
+    add_provider_args(p_demo)
     p_demo.set_defaults(func=_cmd_demo)
 
     p_doctor = sub.add_parser("doctor", help="check Docker, Python and dependencies")
@@ -353,8 +420,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_dotenv() -> None:
+    """Load a ``.env`` file from the current working directory into ``os.environ``.
+
+    Only sets variables that are not already present in the environment.
+    Supports simple ``KEY=value`` lines, inline comments (``#``), and blank
+    lines.  Does NOT support quoting, multi-line values, or variable expansion.
+    """
+    dotenv_path = Path.cwd() / ".env"
+    if not dotenv_path.is_file():
+        return
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        # Strip inline comments from value (simple # after whitespace).
+        if "#" in value:
+            for i, ch in enumerate(value):
+                if ch == "#" and (i == 0 or value[i - 1].isspace()):
+                    value = value[:i].rstrip()
+                    break
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
+    _load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
